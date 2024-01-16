@@ -1,0 +1,729 @@
+##################################
+##  Marconi, Vernaz et al 2024  ##
+##                          	##
+##     AM and GMV July 2023     ##
+##################################
+
+
+
+###################################################
+## QC and Adapter/low-quality sequence trimming  ##
+###################################################
+
+module purge
+module load FastQC/0.11.8-Java-1.8
+module load cutadapt/4.1-GCCcore-10.3.0
+
+ID=$(sed -n ${SLURM_ARRAY_TASK_ID}p sampleID.txt)
+echo $ID
+
+TrimGalore-0.6.6/trim_galore --paired --fastqc -o . ${ID}_1.fq.gz ${ID}_2.fq.gz
+
+
+
+################################################################
+# Gene Mapping and Quantification - Protein-Coding (ensembl)  ##
+################################################################
+
+##
+#STAR index
+
+STAR --runThreadN 5 --runMode genomeGenerate --genomeSAindexNbases 13 --genomeDir _star_IDX/ --genomeFastaFiles Astatotilapia_calliptera.fAstCal1.2.dna_sm.toplevel.fa --sjdbGTFfile Astatotilapia_calliptera.fAstCal1.2.105.gtf --sjdbOverhang 149
+
+
+##
+#STAR mapping and gene quantification using STAR in-built HTSeq programme
+
+module purge
+module load STAR/2.7.1a-foss-2018b
+module load SAMtools/1.15-GCC-10.3.0
+module load gzip/1.10-GCCcore-10.3.0
+
+ID=$(sed -n ${SLURM_ARRAY_TASK_ID}p sampleID.txt)
+starIDX=_PATHGENOME/AstCal1.2_ensembl_GCA_900246225.3/_star_IDX
+gftfile=_PATHGENOME/AstCal1.2_ensembl_GCA_900246225.3/Astatotilapia_calliptera.fAstCal1.2.105.gtf #ensembl genome
+
+STAR \
+--runThreadN 5 \
+--genomeDir $starIDX  \
+--readFilesCommand gunzip -c \
+--readFilesIn  ${ID}_1_val_1.fq.gz ${ID}_2_val_2.fq.gz \
+--sjdbGTFfile $gftfile \
+--outSAMtype BAM Unsorted \
+--quantMode GeneCounts \
+--outFileNamePrefix ./_star_mapping/${ID} \
+
+
+
+###################################################
+# Transposable Elements Expression Quantification #
+###################################################
+
+##
+#STAR mapping
+
+for i in *_1_val_1.fq ; do \
+STAR \
+--runThreadN 5 \
+--genomeDir PATHGENOME/AstCal1.2_ensembl_GCA_900246225.3/_star_IDX \
+--readFilesIn $i $(echo $i |sed 's/_1_val_1.fq/_2_val_2.fq/') \
+--sjdbGTFfile PATH/Astatotilapia_calliptera.fAstCal1.2.105.gtf \
+--outSAMtype BAM Unsorted \
+--chimSegmentMin  10 \
+--winAnchorMultimapNmax  200 \
+--outFilterMultimapNmax   100 \
+--outFileNamePrefix _STAR_mapping_preTEcount/$(basename $i |sed 's/_1_val_1.fq//') \
+; done 
+
+
+##
+# TEcount quantification using RepeatMasker
+
+for i in *out.bam ; do \
+TEcount \
+-b $i \
+--TE /seq/AstCal1.2_ensembl_GCA_900246225.3/repeats/Astatotilapia_calliptera.fAstCal1.2.dna_sm.toplevel.fa.out.bed.gtf \
+--GTF /seq/AstCal1.2_ensembl_GCA_900246225.3/Astatotilapia_calliptera.fAstCal1.2.105.gtf \
+--stranded reverse \
+--mode multi \
+ \
+; done 
+
+
+
+
+
+###############################################
+# Transposable elements and repeat annotation #
+###############################################
+
+
+##
+#RepeatModeler index
+
+module purge
+module load RepeatModeler/2.0.2a-foss-2021a
+BuildDatabase -name AC_1.2 Astatotilapia_calliptera.fAstCal1.2.dna_sm.toplevel.fa
+
+##
+#RepeatModeler
+
+module purge
+module load RepeatModeler/2.0.2a-foss-2021a
+RepeatModeler  -database AC_1.2 -LTRStruct -pa 4
+
+
+##
+# RepeatMasker
+
+module purge
+module load RepeatMasker/4.1.4-foss-2021a
+RepeatMasker -lib AC_1.2-families.fa  -dir .  -s -pa 8  -gff -xsmall -a Astatotilapia_calliptera.fAstCal1.2.dna_sm.toplevel.fa
+
+
+
+
+#########################################
+# Sweep detection (haplotype structure) #
+#########################################
+
+
+##
+# Sweep detection using REHH (3.2.2)
+
+# install.packages("rehh")
+library(rehh)
+library(tidyverse)
+
+#for all chromosomes, the following codes to measure xpEHH values were run:
+AC_hh <- data2haplohh(hap_file = "./malawi_cichlids_v3_phase_chr22.filtered_trio_maf5.AConly.vcf.gz",
+                      polarize_vcf = FALSE)
+RL_hh <- data2haplohh(hap_file = "./malawi_cichlids_v3_phase_chr22.filtered_trio_maf5.RLonly.vcf.gz",
+                      polarize_vcf = FALSE)
+
+AC_hh_f <- subset(AC_hh, min_maf = 0.05)
+RL_hh_f <- subset(RL_hh, min_maf = 0.05)
+
+AC_scan <- scan_hh(AC_hh_f, polarized = FALSE)
+RL_scan <- scan_hh(RL_hh_f, polarized = FALSE)
+
+ACvsRL <- ies2xpehh(AC_scan, RL_scan,
+                    popname1 = "AC", popname2 = "RL",
+                    include_freq = T)
+
+ACvsRL_df <- tbl_df(ACvsRL)
+colnames(ACvsRL_df) <- tolower(colnames(ACvsRL_df))
+write_tsv(ACvsRL_df, "./ACvsRL_chr22_xpEHH.tsv")
+
+
+### merge all chr files using bash
+cat *txt > ACvsRL_allChr.tsv
+
+#remove chr prefix 
+sed 's/chr//g' ACvsRL_allChr.tsv > ACvsRL_allChr.noChr.tsv
+
+# convert to bed, pos-1 (start), pos (end) as per bedtools recommendations
+awk 'BEGIN {OFS="\t"} ; { print $1, $2-1, $2, $3, $4,$5,$6,$7,$8}' ACvsRL_allChr.noChr.tsv > ACvsRL_allChr.noChr.bed.txt
+
+# sort bed
+sortBed -i ACvsRL_allChr.noChr.bed.txt > ACvsRL_allChr.noChr.bed.sort.txt
+
+# isolate outliers (R)
+xpEHH_allChr <- read.table("ACvsRL_allChr.noChr.tsv",h=F)
+xpEHH_allChr_na <- na.omit(xpEHH_allChr)
+colnames(xpEHH_allChr_na)=c("chr",	"position"	,"freq_maj.ac",	"freq_min.ac",	"freq_maj.rl"	,"freq_min.rl",	"xpehh_ac_rl",	"logpvalue")
+
+library(ggplot2)
+
+#Plot Manhattan logp3
+ggplot(xpEHH_allChr_na,aes(position,logpvalue))+geom_jitter(aes(color = ifelse(logpvalue > 3, "deeppink2", "black")))+theme_classic()+ facet_wrap(vars(chr),scales = "free")+scale_color_identity()
+
+# merge significant SNPs that are 50kbp apart from each other (bash and bedrolls)
+mergeBed -d 50000 -o count -c 1 -I ACvsRL_allChr.noChr_filtered_log3min.bed > ACvsRL_allChr.noChr_filtered_log3min_merge50k.bed
+
+
+# identify closest gene to islands/regions
+closestBed -D b -k 1 -a ACvsRL_allChr.noChr_filtered_log3min_merge50k.bed -b GenesCoordinates_AC1.2ensembl.sort.txt > closestGene_xpEHH_ACvsRL_allChr.noChr_filtered_log3min_merge50k.txt
+
+## Permutation tests
+# filter annotation file for coding, non-coding genes (ensembl)
+awk -F'\t' '$3 ~ /gene|linc_RNA|ncRNA_gene/'  Astatotilapia_calliptera.fAstCal1.2.105.gff3 > fAstCal1.2.105.gff3.Gene.lincR.ncRNAgene_only.gff3
+
+# create annotation for regions 25kbp updtream of genes
+flankBed -l 25000 -r 0 -s -i fAstCal1.2.105.gff3.Gene.lincR.ncRNAgene_only.sort.gff3.txt  -g fAstCal1.2.105.GenomeSize.short.txt > Gene_flank_UP_25kbp.gff3.txt
+
+
+# Permutation test - MEDIAN - Flanking Up 25kbp, for each gene expression cluster (example below with 6 genes)
+median_randomXPEHH <- replicate(1000, {
+  random_6genes <- subs_xpEHH_perClust[sample(nrow(subs_xpEHH_perClust), 15), ]
+  x<- median(random_6genes$xpEHH)
+  return(x)
+})
+
+hist(median_randomXPEHH,breaks = 100)
+abline(v=0.2571) #observed value
+(sum(abs(median_randomXPEHH) > abs(0.2571)) + 1) / (length(median_randomXPEHH) + 1) #p value
+
+
+
+
+######################################################################################################
+# Heatmap of log2FC values for DEGs with NC development-related functions and GO enrichment analysis #
+######################################################################################################
+
+library(ggplot2)
+library(ggpubr)
+library(MetBrewer)
+library(pheatmap)
+
+log2FC_GOs_NC_all <- read.csv('./ensembl_IDs_GO_NC_p005_lfcFilter0585_20230306.csv')
+log2FC_GOs_NC_all <- log2FC_GOs_NC_all[!apply(is.na(log2FC_GOs_NC_all) | log2FC_GOs_NC_all == "", 1, all),] #remove empty rows
+rownames(log2FC_GOs_NC_all) <- log2FC_GOs_NC_all$ensembl #assign row names from the ensembl ID column
+log2FC_GOs_NC_all_num = as.matrix(log2FC_GOs_NC_all[,2:9]) #specify which columns contain numerical data for the heatmap
+rownames(log2FC_GOs_NC_all_num) = sapply(log2FC_GOs_NC_all$gene.name,function(x) strsplit(as.character(x),split = "\\\\")[[1]][1])
+newnames_abs_ss <- lapply(
+  rownames(log2FC_HCR_abs_ss_num),
+  function(x) bquote(italic(.(x))))
+
+pheatmap(log2FC_GOs_NC_all_num, scale = "row", cluster_cols = FALSE, cutree_rows = 7, main = "log2FC values for NC-related DEGs", fontsize_row = 10,
+         col=rev(met.brewer("Cassatt2",n=100)), border_color = NA)
+
+
+##
+# run gProfiler
+library(gprofiler2)
+library(treemap)
+
+query <- log2FC_GOs_NC_all$ensembl
+
+## Running gprofiler to identify enriched processes among significant genes
+
+g <- gprofiler_results_oe <- gost(query, 
+                                  organism = "acalliptera",
+                                  ordered_query = F, 
+                                  exclude_iea = F, 
+                                  significant = TRUE,
+                                  correction_method = "fdr",
+                                  domain_scope = "annotated", user_threshold = 0.05)
+head(g$result, 10)
+
+gostplot(g, capped = TRUE, interactive = TRUE)
+
+
+
+
+
+###################################
+# All DEGs heatmap and clustering #
+###################################
+
+##
+# Heatmap of all DEGs
+
+NormCount <- read.table("NormalisedDeseq2_GeneCountMatrix.txt",h=T)
+unique <- read.table("UniqueGeneID_DEG.txt",h=T)
+write.table(DEGunic_normCount_merge,"./DEGunic_normCount_merge.txt",col.names = T,row.names = F, sep = "\t",quote = F)
+
+##
+# select only average of biological replicates
+DEGunic_normCount_merge_avg <- DEGunic_normCount_merge[,c(1,52:68)]
+
+library(pheatmap)
+library(MetBrewer)
+
+pheatmap(DEGunic_normCount_merge_avg[,2:18], border_color=NA, cluster_cols=F, show_rownames=F, cutree_rows=7,col=rev(met.brewer("Troy",n=100)),main="absSS DEG Sept2023, n=12611",scale = "row")
+
+# add extra column for cluster allocation
+x <- pheatmap(DEGunic_normCount_merge_avg[,2:18], border_color=NA, cluster_cols=F, show_rownames=F, cutree_rows=7,col=rev(met.brewer("Troy",n=100)),main="absSS DEG Sept2023, n=12611",scale = "row")
+DEGunic_normCount_merge_avg_ClusterK7 <- cbind(DEGunic_normCount_merge_avg,cluster_k7=cutree(x$tree_row,k=7))
+write.table(DEGunic_normCount_merge_avg_ClusterK7,"./DEGunic_normCount_merge_ClusterK7.txt",col.names = T,row.names = F, sep = "\t",quote = F)
+
+
+# Output Heatmap with Cluster 
+pheatmap(DEGunic_normCount_merge_avg_ClusterK7[,2:18], border_color=NA, cluster_cols=F, show_rownames=T, cutree_rows=7,col=rev(met.brewer("Troy",n=100)),main="absSS DEG Sept2023, n=12611",scale = "row",labels_row = DEGunic_normCount_merge_avg_ClusterK7$cluster_k7,fontsize_row = 2)
+
+
+## Plot gene expression trend by Cluster
+# Scale function
+cal_z_score <- function(x){
+  (x - mean(x)) / sd(x)
+}
+
+# Scale Exp value
+DEGunic_normCount_merge_avg_ClusterK7_scale <- as.data.frame(t(apply(DEGunic_normCount_merge_avg_ClusterK7[2:18], 1, cal_z_score)))
+DEGunic_normCount_merge_avg_ClusterK7_scale <- cbind(DEGunic_normCount_merge_avg_ClusterK7,DEGunic_normCount_merge_avg_ClusterK7_scale)
+DEGunic_normCount_merge_avg_ClusterK7_scale_clean <- DEGunic_normCount_merge_avg_ClusterK7_scale[,c(1,19:36)]
+rm(DEGunic_normCount_merge_avg_ClusterK7_scale)
+
+library(tidyverse)
+gather_scale_absSS <- gather(DEGunic_normCount_merge_avg_ClusterK7_scale_clean,ID,scale_NormCount,3:19)
+
+#Add Stage and Species columns
+gather_scale_absSS$stage = "NA"
+gather_scale_absSS[grep("04", gather_scale_absSS$ID), ][,"stage"] <- "04"
+gather_scale_absSS[grep("10", gather_scale_absSS$ID), ][,"stage"] <- "10"
+gather_scale_absSS[grep("15", gather_scale_absSS$ID), ][,"stage"] <- "15"
+gather_scale_absSS[grep("18", gather_scale_absSS$ID), ][,"stage"] <- "18"
+gather_scale_absSS[grep("20", gather_scale_absSS$ID), ][,"stage"] <- "20"
+gather_scale_absSS[grep("22", gather_scale_absSS$ID), ][,"stage"] <- "22"
+gather_scale_absSS[grep("30", gather_scale_absSS$ID), ][,"stage"] <- "30"
+gather_scale_absSS[grep("26", gather_scale_absSS$ID), ][,"stage"] <- "26"
+gather_scale_absSS[grep("37", gather_scale_absSS$ID), ][,"stage"] <- "37"
+gather_scale_absSS$species = "NA"
+gather_scale_absSS[grep("RC", gather_scale_absSS$ID), ][,"species"] <- "RC"
+gather_scale_absSS[grep("MB", gather_scale_absSS$ID), ][,"species"] <- "AC"
+
+
+ggplot(gather_scale_absSS,aes(stage, scale_NormCount,colour = species,shape=species))+geom_jitter(alpha=0.02)+geom_violin(draw_quantiles = 0.5,fill=NA)+theme_linedraw()+ scale_color_manual(values = c("#D2691E", "#3B638C"))+facet_grid(cluster_k7 ~ .)
+
+
+
+##############################################################
+# All DEGs - cluster GO enrichment analysis and balloon plot #
+##############################################################
+
+#create a temp file for each cluster in turn
+data_for_GO <- read.csv('~/temp_file.csv')
+v1 <- data_for_GO$ensembl
+
+
+GO_cluster <-full_getGO(organism = "Astatotilapia calliptera", 
+                               genes    = v1, #string of gene ids you want to annotate
+                               filters  = "ensembl_gene_id") # above query's category
+
+head(GO_cluster)
+write.csv(GO_cluster, './cluster7_GO.csv')
+
+## Running gprofiler to identify the TOP 10 enriched processes among significant genes (for each cluster in turn)
+
+g <- gprofiler_results_oe <- gost(query, 
+                                  organism = "acalliptera",
+                                  ordered_query = F, 
+                                  exclude_iea = F, 
+                                  significant = TRUE,
+                                  correction_method = "fdr",
+                                  domain_scope = "annotated", user_threshold = 0.05)
+head(g$result, 10)
+
+#plot all together
+
+data <- read.csv('./all_clusters_gProfiler_results_collapsed.csv')
+
+data <- data[!apply(is.na(data) | data == "", 1, all),]
+
+my_cols <- c("#DACAF4", "#3E1D70")
+
+
+p <-
+  ggballoonplot(data, y = "term_name", x = "cluster_id", size = "gene_fraction", color = "p_value", shape = 19, alpha = 0.5, font.label = list(size = 10, color = "black"),
+                   ggtheme = theme_bw()) + scale_color_gradientn(colors = my_cols)  +
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10)) + scale_x_continuous(limits = c(1,7), breaks = c(1,2,3,4,5,6,7))
+
+
+p + facet_grid(vars(category), drop = TRUE, scales = "free")
+
+
+
+
+####################################################
+# DESeq2 pipeline for differential gene expression #
+####################################################
+
+library(htmltools)
+library( "DESeq2" )
+library(ggplot2)
+library( "biomaRt" )
+library(gprofiler2)
+
+#this analysis generates the following files:
+# res_stage_Sig005.csv => DEGs with p < 0.05
+# res_stage_Sig005_lfc0585.csv => DEGs with p < 0.05 & abs log2FoldChange >= 1.5
+# res_ss_all_st_p005_annotated.csv => DEGs with p < 0.05 + annotation
+# GO_timecourse_ss_p005.csv => ensembl IDs of DEGs with p < 0.05 + GO term description + GO term ID
+# GO_results_timecourse_ss_p005.csv => all GO terms ordered by count
+
+
+# read data and metadata --------------------------------------------------
+
+countData <- read.csv('./ReadsPerGene_MB4ss_RC4ss_outlier_removed.csv', header = TRUE, sep = ",")
+#View(countData)
+head(countData)
+
+metaData <- read.csv('./metadata_MB4ss_RC4ss_outlier_removed.csv', header = TRUE, sep = ",")
+metaData
+
+metaData$stage =as.factor(metaData$stage)
+metaData$replicate =as.factor(metaData$replicate)
+metaData$species =as.factor(metaData$species)
+
+as.data.frame(metaData)
+
+# experiment design -------------------------------------------------------
+
+ddsP <- DESeqDataSetFromMatrix(countData=countData, colData=metaData, design=~species, tidy = TRUE) 
+nrow(ddsP)
+
+#optional pre-filtering of low-count genes
+keep <- rowSums(counts(ddsP)) >= 10
+ddsP <- ddsP[keep,]
+nrow(ddsP)
+
+
+#----grouped results-----
+ddsP$group <- factor(paste0(ddsP$species, ddsP$stage))
+design(ddsP) <- ~ group
+ddsP$group <- relevel( ddsP$group, "MB4ss" ) # set reference sample
+ddsP$group <- droplevels(ddsP$group)
+as.data.frame( colData(ddsP) )
+
+ddsDE <- DESeq(ddsP)
+
+resSig <- results( ddsDE, contrast = c("group", "RC4ss", "MB4ss"), alpha = 0.05)  #contrast <- c("condition", "level_to_compare", "base_level")
+sum(resSig$padj < 0.05, na.rm=TRUE )
+resSig005_LFC <- resSig[ which(resSig$padj < 0.05 ), ]
+summary(resSig005_LFC)
+
+#write.csv( as.data.frame(resSig005_LFC), './DEseq2_res_MB4ss_RC4ss_p005_lfc0585.csv')
+
+#new_frame <- subset(res_ss_Sig005, res_ss_Sig005$log2FoldChange >= -1.5 & res_ss_Sig005$log2FoldChange <= 1.5)
+resSig005_LFC1 <- subset(resSig005_LFC, resSig005_LFC$log2FoldChange <= -1.5)
+resSig005_LFC2 <- subset(resSig005_LFC, resSig005_LFC$log2FoldChange >= 1.5)
+res_4ss_Sig005_LFC <- rbind(resSig005_LFC1, resSig005_LFC2)
+
+#head( res_ss_Sig005[ order( res_ss_Sig005$log2FoldChange ), ] ) # strongest down-regulation
+#tail( res_ss_Sig005[ order( res_ss_Sig005$log2FoldChange ), ] ) # strongest up-regulation
+
+write.csv( as.data.frame(res_4ss_Sig005_LFC), './DEseq2_res_MB4ss_RC4ss_p005_lfc0585_2.csv')
+
+#annotation
+res_4ss_Sig005_LFC$ensembl <- sapply( strsplit( rownames(res_4ss_Sig005_LFC), split="\\+" ), "[", 1 )
+library( "biomaRt" )
+options(timeout = 30000)
+ensembl = useMart( "ensembl", dataset = "acalliptera_gene_ensembl" )
+genemap <- getBM( attributes = c("ensembl_gene_id", "entrezgene_id", "external_gene_name", "description"),
+                  filters = "ensembl_gene_id",
+                  values = res_4ss_Sig005_LFC$ensembl,
+                  mart = ensembl,
+                  useCache = FALSE)
+idx <- match( res_4ss_Sig005_LFC$ensembl, genemap$ensembl_gene_id )
+res_4ss_Sig005_LFC$entrez <- genemap$entrezgene[ idx ]
+res_4ss_Sig005_LFC$external_gene_name <- genemap$external_gene_name[ idx ]
+res_4ss_Sig005_LFC$description <- genemap$description [ idx ]
+
+#add gene symbols as well by gconvert 
+NCconvert <- gconvert(query = res_4ss_Sig005_LFC$ensembl, organism = "acalliptera", 
+                      target="entrezgene", mthreshold = Inf, filter_na = TRUE)
+idxNCconvert <- match( res_4ss_Sig005_LFC$ensembl, NCconvert$input )
+res_4ss_Sig005_LFC$Gene.Symbol <- NCconvert$target[ idxNCconvert ]
+res_4ss_Sig005_LFC$Gene.Name <- NCconvert$name[ idxNCconvert ]
+
+head(res_4ss_Sig005_LFC)
+
+write.csv( as.data.frame(res_4ss_Sig005_LFC), './DEseq2_res_MB4ss_RC4ss_p005_lfc0585_annotated.csv')
+
+# -> repeat for all pairwise comparisons
+# -> filter post-hoc based on set threshold value of log2 Fold Change (here <-0.585 and >0.585)
+
+
+
+############################
+# Gene Ontology annotation #
+############################
+
+
+#------GOslim annotation - download all data ----
+library(biomartr)
+biomartr::getMarts()
+#organismAttributes("Astatotilapia calliptera", topic = "id", update = TRUE)
+
+#Retrieve Available Attributes from a Specific Dataset
+
+# show all elements of the data.frame
+options(tibble.print_max = Inf)
+# list all available attributes for dataset: acalliptera_gene_ensembl
+head( biomartr::getAttributes(mart    = "ENSEMBL_MART_ENSEMBL", 
+                              dataset = "acalliptera_gene_ensembl"), 10 )
+
+#Retrieve Available Filters from a Specific Dataset
+
+# show all elements of the data.frame
+options(tibble.print_max = Inf)
+# list all available filters for dataset: acalliptera_gene_ensembl
+head( biomartr::getFilters(mart    = "ENSEMBL_MART_ENSEMBL", 
+                           dataset = "acalliptera_gene_ensembl"), 10 )
+
+#Construct BioMart queries with biomartr
+
+#head(biomartr::organismAttributes("Astatotilapia calliptera", topic = "id"))
+head(biomartr::organismAttributes("Astatotilapia calliptera", topic = "refseq"))
+
+# retrieve the genome of A. calliptera - you only need to do it once
+#genome_path <- biomartr::getGenome(
+# db = "refseq",
+# organism = "Astatotilapia calliptera",
+# reference = FALSE,
+# release = NULL,
+# gunzip = FALSE,
+# path = file.path("_ncbi_downloads", "genomes"),
+# assembly_type = "toplevel")
+
+genome_path <- '~/_ncbi_downloads/genomes/Astatotilapia_calliptera_genomic_refseq.fna.gz'
+
+Acalliptera_genome <- biomartr::read_genome(genome_path, format = "fasta")
+
+# retrieve the proteome of A.calliptera from refseq - you only need to do it once
+# file_path <- biomartr::getProteome( db       = "refseq",
+# organism = "Astatotilapia calliptera",
+# path     = file.path("_ncbi_downloads","proteomes") )
+
+file_path <- '~/_ncbi_downloads/proteomes/Astatotilapia_calliptera_protein_refseq.faa.gz'
+
+Acalliptera_proteome <- biomartr::read_proteome(file_path, format = "fasta")
+
+# remove splice variants from id
+gene_set <- unlist(sapply(strsplit(Acalliptera_proteome@ranges@NAMES, ".",fixed = TRUE), function(x) x[1]))
+
+summary(gene_set)
+
+result_BM <- biomartr::biomart( genes      = gene_set, # genes were retrieved using biomartr::getGenome()
+                                mart       = "ENSEMBL_MART_ENSEMBL", # marts were selected with biomartr::getMarts()
+                                dataset    = "acalliptera_gene_ensembl", # datasets were selected with biomartr::getDatasets()
+                                attributes = c("ensembl_gene_id","ensembl_peptide_id"), # attributes were selected with biomartr::getAttributes()
+                                filters    = "refseq_peptide_predicted") # specify what ID type was stored in the fasta file retrieved with biomartr::getGenome()
+
+result_BM 
+
+#GO full annotation -----------------
+
+#create a string of gene ids you want to annotate
+
+#data_for_GO <- read.csv('./res_ss_all_st_p005_LFC_annotated.csv')
+data_for_GO <- as.data.frame(res_4ss_Sig005_LFC)
+v1 <- data_for_GO$ensembl
+summary(v1)
+
+#create a function to get full GO annotation
+full_getGO <- function (organism, genes, filters, ...) 
+{
+  name <- NULL
+  orgAttr <- organismAttributes(organism = organism, topic = "go")
+  GOattributes <- c("ensembl_peptide_id", "go_id")
+  GOattr_df <- dplyr::filter(orgAttr, name %in% GOattributes)
+  if (dim(GOattr_df)[1] == 0) 
+    stop("Unfortunately for '", organism, "' no GO attributes could be found.")
+  m <- names(table(GOattr_df[, "mart"]))
+  d <- names(table(GOattr_df[, "dataset"]))
+  if (m %in% c("ensembl")) {
+    GOattributes <- "go_id"
+  }
+  else {
+    GOattributes <- c("external_gene_name", "description", "go_id", "name_1006")
+  }
+  if ((length(m) > 1) | (length(d) > 1)) 
+    stop("GO related attributes have been found in more than one mart or \n            dataset: mart = ", 
+         m, " ; dataset = ", d)
+  return(biomart(genes = genes, mart = m, dataset = d, attributes = GOattributes, 
+                 filters = filters, ...))
+}
+
+GOfull_4ss_005_LFC <-full_getGO(organism = "Astatotilapia calliptera", 
+                                    genes    = v1, #string of gene ids you want to annotate
+                                    filters  = "ensembl_gene_id") # above query's category)
+
+head(GOfull_4ss_005_LFC)
+write.csv(as.data.frame(GOfull_4ss_005_LFC), './GOfull_all_MB4ss_RC4ss_p005_lfc0585.csv')
+
+idx2 <- match( GOfull_MB27ss_RC26ss_005$ensembl_gene_id, res_MB27ss_RC26ss_Sig005$ensembl )
+GOfull_MB27ss_RC26ss_005$log2FoldChange <- res_MB27ss_RC26ss_Sig005$log2FoldChange [ idx2 ]
+GOfull_MB27ss_RC26ss_005$padj <- res_MB27ss_RC26ss_Sig005$padj [ idx2 ]
+
+head(GOfull_MB27ss_RC26ss_005)
+
+write.csv(GOfull_MB27ss_RC26ss_005, './GOfull_all_MB30ss_RC30ss_p005_log2_padj.csv')
+
+#####-------GO Enrichment analysis---------
+
+#data_for_GOenrichment <- read.csv('./DEseq2_res_timecourse_ss_p005_LFC_annotated.csv')
+data_for_GOenrichment <-as.data.frame(res_4ss_Sig005_LFC)
+
+resSigLFC_down <- subset(data_for_GOenrichment, data_for_GOenrichment$log2FoldChange < -1.5)
+resSigLFC_up <- subset(data_for_GOenrichment, data_for_GOenrichment$log2FoldChange > 1.5)
+
+# order genes by padj-value
+resSigLFC_up_ordered = resSigLFC_up[order(resSigLFC_up$log2FoldChange, decreasing = TRUE),]
+resSigLFC_down_ordered = resSigLFC_down[order(resSigLFC_down$log2FoldChange, decreasing = TRUE),]
+
+# ordered enrichment analysis - by padj
+go_up_ordered = gost(query = resSigLFC_up_ordered$ensembl, organism = "acalliptera",
+                     ordered_query = TRUE, sources=c("GO:BP", "GO:MF", "GO:CC"))
+gostplot(go_up_ordered, interactive=TRUE)
+
+
+
+####################################################################
+# Venn diagram of DEGs with functions in                           #
+# neural crest development, pigmentation and craniofacial skeleton #
+####################################################################
+
+p_ss_NC <- read.csv('./GO_annotated/pairwise/pairwise_ss_ensembl_NC.csv')
+p_ss_pigm <- read.csv('./GO_annotated/pairwise/pairwise_ss_ensembl_pigm.csv')
+p_ss_cran <- read.csv('./pairwise_ss_ensembl_cran.csv')
+
+#create a string of gene ids you want to annotate
+vp1 <- p_ss_NC$ensembl
+vp2 <- p_ss_pigm$ensembl
+vp3 <- p_ss_cran$ensembl
+
+#5c5f73 - NC
+#f9c365 - pigm
+#993028 - cranio
+
+venn.diagram(
+  x = list(vp1, vp2,vp3),
+  filename = '#14_venn_diagramm.png',
+  category.names = c("NC" , "pigmentation ", "craniofacial"),
+  output = TRUE ,
+  imagetype="png" ,
+  height = 800 , 
+  width = 800 , 
+  resolution = 300,
+  compression = "lzw",
+  lwd = 1,
+  col=c("#5c5f73", '#f9c365', '#993028'),
+  fill = c(alpha("#5c5f73",0.3), alpha('#f9c365',0.3), alpha("#993028",0.3)),
+  cex = 0.5,
+  fontfamily = "sans",
+  cat.cex = 0.3,
+  cat.default.pos = "outer",
+  cat.pos = c(-27, 30, 15),
+  cat.dist = c(0.055, 0.055, 0.085),
+  cat.fontfamily = "sans",
+  cat.col = c("#5c5f73", '#f9c365', '#993028'),
+  rotation = 1, reverse = 1)
+
+
+
+##################################################
+# Normalised gene expression profiles along time #
+##################################################
+
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(tidyverse)
+library(ggpmisc)
+library(fields)
+sox10s_counts <- read.csv('./two_sox10s_mRNA_counts_AC&RC.csv')
+df_AC_sox10s <- subset(sox10s_counts, Species == "AC")
+df_RC_sox10s <- subset(sox10s_counts, Species == "RC")
+
+#in situ colours per gene
+AC_sox10s <- ggplot(df_AC_sox10s, aes(x=Stage, y=count_norm_species, color=category)) + geom_point(aes(color = category), size = 2, alpha = 0.5) + 
+  geom_smooth(aes(color = category, fill = category), linewidth = 1.5, alpha = 0.2, level = 0.95)  +
+  scale_color_manual(values = c("RC sox10" = "#b8007c", "RC sox10-like" = "#76b5c5", "AC sox10" = "#b8007c", "AC sox10-like" = "#ffa20f")) + 
+  scale_y_continuous(limits = c(0,1)) + scale_x_continuous(limits=c(4,37), breaks =c(4, 10, 15, 18, 20, 22, 26, 30, 37)) +
+  xlab("somite stage") +  ylab("normalised expression")  +
+  theme(rect = element_rect(fill = "transparent")) + scale_size_identity() + theme_bw() + 
+  theme(panel.grid.minor.y = element_blank(), panel.grid.minor.x = element_blank(), panel.grid.major = element_blank()) + 
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10)) + theme(aspect.ratio = 0.65) + 
+  theme(panel.border = element_rect(colour = "black", fill = NA)) + 
+  theme(axis.title = element_text(size = 10)) +
+  scale_alpha_identity() +
+  scale_fill_manual(values=c("RC sox10" = "#b8007c", "RC sox10-like" = "#ffa20f", "AC sox10" = "#b8007c", "AC sox10-like" = "#ffa20f")) +
+  labs(title="mRNA counts of sox10 paralogs in AC") + facet_grid(Species ~ .)
+
+RC_sox10s <- ggplot(df_RC_sox10s, aes(x=Stage, y=count_norm_species, color=category)) + geom_point(aes(color = category), size = 2, alpha = 0.5) + 
+  geom_smooth(aes(color = category, fill = category), linewidth = 1.5, alpha = 0.2, level = 0.95)  +
+  scale_color_manual(values = c("RC sox10" = "#b8007c", "RC sox10-like" = "#ffa20f", "AC sox10" = "#b8007c", "AC sox10-like" = "#ffa20f")) + 
+  scale_y_continuous(limits = c(0,1)) + scale_x_continuous(limits=c(4, 37), breaks =c(4, 10, 15, 18, 20, 22, 26, 30, 37)) +
+  xlab("somite stage") +  ylab("normalised expression")  +
+  theme(rect = element_rect(fill = "transparent")) + scale_size_identity() + theme_bw() + 
+  theme(panel.grid.minor.y = element_blank(), panel.grid.minor.x = element_blank(), panel.grid.major = element_blank()) + 
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10)) + theme(aspect.ratio = 0.65) + 
+  theme(panel.border = element_rect(colour = "black", fill = NA)) + 
+  theme(axis.title = element_text(size = 10)) +
+  scale_alpha_identity() +
+  scale_fill_manual(values=c("RC sox10" = "#b8007c", "RC sox10-like" = "#ffa20f", "AC sox10" = "#b8007c", "AC sox10-like" = "#ffa20f")) +
+  facet_grid(Species ~ .)
+
+ggarrange(AC_sox10s, RC_sox10s + rremove("xlab"), ncol = 1, nrow = 2, common.legend = FALSE, align = "hv")
+
+
+
+####################################################################
+# CRISPR experiment - melanophore quantification boxplots for 7dpf #
+####################################################################
+
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+library(tidyverse)
+library(ggpmisc)
+library(fields)
+library(ggthemes)
+
+mel_counts <- read.csv('./melanophore_counts_sox10_CRISPR.csv', header = TRUE)
+
+ggplot(mel_counts, aes(x=genotype, y=mel, colour = genotype))+geom_boxplot(lwd=1, outlier.shape = NA)+geom_jitter(size = 2.5, alpha = 0.7) + 
+  scale_color_manual(values = c("mut" = "#b8007c", "WT" = "black", "TR" = "#40ca33"))+
+  labs(title="melanophore counts in ACM at 7dpf") + theme_bw() + 
+  theme(panel.grid.minor.y = element_blank(), panel.grid.minor.x = element_blank(), panel.grid.major.x = element_blank()) + 
+  theme(panel.border = element_rect(colour = "black", fill = NA)) + 
+  theme(axis.title = element_text(size = 20)) + scale_y_continuous(limits = c(0,100)) + scale_x_discrete(limits=c("WT","TR", "mut")) +
+  theme_fivethirtyeight() + theme_minimal() + theme(axis.text.x = element_text(size = 15), axis.text.y = element_text(size = 15)) +
+  theme(aspect.ratio = 1)
+
+df_TR_mut <- subset(mel_counts, treatment == "injected")
+df_no_CRISPR <- subset(mel_counts, CRISPR == "no")
+df_WT_mut <- subset(mel_counts, WT_mut == "yes")
+
+#for two groups
+t.test(mel ~ genotype, data = df_TR_mut, var.equal = TRUE)
+
+#for more than 2 groups - ANOVA
+res_aov <-aov(mel ~ genotype, data = mel_counts)
+
+summary(res_aov)
+
+TukeyHSD(res_aov, which = "genotype")
+

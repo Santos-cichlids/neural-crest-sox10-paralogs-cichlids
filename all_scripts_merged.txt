@@ -216,17 +216,46 @@ library(ggpubr)
 library(MetBrewer)
 library(pheatmap)
 
-log2FC_GOs_NC_all <- read.csv('./ensembl_IDs_GO_NC_p005_lfcFilter0585_20230306.csv')
-log2FC_GOs_NC_all <- log2FC_GOs_NC_all[!apply(is.na(log2FC_GOs_NC_all) | log2FC_GOs_NC_all == "", 1, all),] #remove empty rows
-rownames(log2FC_GOs_NC_all) <- log2FC_GOs_NC_all$ensembl #assign row names from the ensembl ID column
-log2FC_GOs_NC_all_num = as.matrix(log2FC_GOs_NC_all[,2:9]) #specify which columns contain numerical data for the heatmap
-rownames(log2FC_GOs_NC_all_num) = sapply(log2FC_GOs_NC_all$gene.name,function(x) strsplit(as.character(x),split = "\\\\")[[1]][1])
-newnames_abs_ss <- lapply(
-  rownames(log2FC_HCR_abs_ss_num),
-  function(x) bquote(italic(.(x))))
+# Read the data from CSV
+log2FC_GOs_NC_all <- read.csv('/Users/aleksandra/Cambridge University Dropbox/Aleksandra Marconi/NC_RNAseq/Mapping/STAR_gene/DEG_DESeq2/figures/abs_ss/ensembl_IDs_GO_NC_p005_lfcFilter0585_20230306_NA.csv')
 
-pheatmap(log2FC_GOs_NC_all_num, scale = "row", cluster_cols = FALSE, cutree_rows = 7, main = "log2FC values for NC-related DEGs", fontsize_row = 10,
-         col=rev(met.brewer("Cassatt2",n=100)), border_color = NA)
+# Remove empty rows
+log2FC_GOs_NC_all <- log2FC_GOs_NC_all[!apply(is.na(log2FC_GOs_NC_all) | log2FC_GOs_NC_all == "", 1, all),]
+
+# Assign row names from the ensembl ID column
+rownames(log2FC_GOs_NC_all) <- log2FC_GOs_NC_all$ensembl
+
+# Convert specified columns to a numeric matrix for the heatmap
+log2FC_GOs_NC_all_num <- as.matrix(log2FC_GOs_NC_all[, 2:9])
+
+# Rename rows based on gene names
+rownames(log2FC_GOs_NC_all_num) <- sapply(log2FC_GOs_NC_all$gene.name, function(x) {
+  split_name <- strsplit(as.character(x), split = "\\\\")[[1]]
+  if (length(split_name) > 0) split_name[1] else x
+})
+
+# Option 2: Temporarily replace NA values for row clustering only
+log2FC_GOs_NC_all_num_clustering <- log2FC_GOs_NC_all_num
+log2FC_GOs_NC_all_num_clustering[is.na(log2FC_GOs_NC_all_num_clustering)] <- 0  # Or use other methods of imputation
+
+# Define a color palette using MetBrewer
+color_palette <- rev(met.brewer("Cassatt2", n = 300))
+
+range_values <- range(log2FC_GOs_NC_all_num, na.rm = TRUE)
+# Define breaks manually, for example from -2 to 2 with small intervals
+breaks <- seq(-4, 4, length.out = 301)
+
+pheatmap(log2FC_GOs_NC_all_num, 
+         scale = "none", 
+         clustering_distance_rows = dist(log2FC_GOs_NC_all_num_clustering),  # Row clustering with imputed data
+         cluster_cols = FALSE,  # Disable column clustering
+         cutree_rows = 7, 
+         main = "log2FC values for NC-related DEGs", 
+         fontsize_row = 10,
+         breaks = breaks,
+         col = color_palette, 
+         border_color = "light gray", 
+         na_col = "white")  # Set NA values to white
 
 
 ##
